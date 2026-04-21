@@ -52,9 +52,11 @@ function Get-Backend {
 
     # Locked detection + pinning
     $mutex = $null
+    $acquired = $false
     try {
         $mutex = [System.Threading.Mutex]::new($false, 'Global\SecretOpsBackendPin')
-        $mutex.WaitOne(5000) | Out-Null
+        $acquired = $mutex.WaitOne(5000)
+        if (-not $acquired) { throw 'Could not acquire backend lock (timeout)' }
 
         # Re-check after lock
         if (Test-Path $BackendFile) { return (Get-Content $BackendFile).Trim() }
@@ -68,7 +70,10 @@ function Get-Backend {
         }
         throw 'No supported secret backend found'
     } finally {
-        if ($mutex) { $mutex.ReleaseMutex(); $mutex.Dispose() }
+        if ($mutex) {
+            if ($acquired) { $mutex.ReleaseMutex() }
+            $mutex.Dispose()
+        }
     }
 }
 
@@ -188,7 +193,13 @@ try {
             try {
                 $psi = New-Object System.Diagnostics.ProcessStartInfo
                 $psi.FileName = $cmd[0]
-                if ($cmd.Length -gt 1) { $psi.Arguments = ($cmd[1..($cmd.Length-1)] -join ' ') }
+                if ($cmd.Length -gt 1) {
+                    # Quote arguments containing whitespace to preserve boundaries
+                    $quotedArgs = $cmd[1..($cmd.Length-1)] | ForEach-Object {
+                        if ($_ -match '\s|"') { '"{0}"' -f ($_ -replace '"', '\"') } else { $_ }
+                    }
+                    $psi.Arguments = $quotedArgs -join ' '
+                }
                 $psi.UseShellExecute = $false
                 $psi.RedirectStandardOutput = $false
                 $psi.RedirectStandardError = $false

@@ -216,6 +216,12 @@ main() {
       [ "${1:-}" = "--" ] && shift || { echo "ERROR: Missing '--' separator" >&2; exit 1; }
       [ $# -lt 1 ] && { echo "ERROR: No command specified after '--'" >&2; exit 1; }
 
+      # Inject requires env-var-safe key name (no dots or hyphens)
+      if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        echo "ERROR: Key '$key' is not a valid environment variable name (use [A-Za-z_][A-Za-z0-9_]*)" >&2
+        exit 1
+      fi
+
       local backend rc=0
       backend=$(_ensure_backend) || exit 1
       local val
