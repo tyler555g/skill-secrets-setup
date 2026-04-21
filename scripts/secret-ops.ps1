@@ -4,20 +4,19 @@
   secret-ops.ps1 — secure secret operations (inject model)
   Values never printed to stdout. Agent calls this; never reads source.
 #>
-[CmdletBinding()]
-param(
-    [Parameter(Position=0)]
-    [ValidateSet('store','inject','list','delete','exists','help')]
-    [string]$Operation = 'help',
-
-    [Parameter(Position=1)]
-    [string]$Key,
-
-    [Parameter(Position=2, ValueFromRemainingArguments)]
-    [string[]]$CommandArgs
-)
+# No [CmdletBinding()]/param() — parse $args manually to preserve '--' token
+# (PowerShell's parameter binder consumes '--' as end-of-parameters)
 
 $ErrorActionPreference = 'Stop'
+
+$Operation = if ($args.Length -ge 1) { $args[0] } else { 'help' }
+$Key = if ($args.Length -ge 2) { $args[1] } else { '' }
+$CommandArgs = if ($args.Length -ge 3) { [string[]]$args[2..($args.Length-1)] } else { @() }
+
+$ValidOps = @('store','inject','list','delete','exists','help')
+if ($Operation -notin $ValidOps) {
+    throw "Invalid operation '$Operation'. Valid: $($ValidOps -join ', ')"
+}
 $ConfigDir = Join-Path $env:USERPROFILE '.config\secret-ops'
 $BackendFile = Join-Path $ConfigDir 'backend'
 $AuditLog = Join-Path $ConfigDir 'audit.log'
@@ -74,6 +73,8 @@ function Get-Backend {
                         'vault' | Out-File $BackendFile -NoNewline -Encoding utf8; return 'vault'
                     }
                 }
+                # Vault is configured but unusable — fail closed, don't silently downgrade
+                throw "Vault is configured (VAULT_ADDR set, token valid) but probe to secret/secret-ops/ failed. Fix Vault permissions, or remove `$env:VAULT_ADDR to use a local backend."
             }
         }
         if (Get-Command git -ErrorAction SilentlyContinue) {
@@ -112,6 +113,10 @@ function Invoke-GcmStore {
     $secret = Read-Host "Enter secret for $GcmKey" -AsSecureString
     $plain = ConvertFrom-SecureStringSafe $secret
     try {
+        # GCM uses line-based git credential protocol — reject multiline secrets
+        if ($plain -match '[\r\n]') {
+            throw "GCM backend does not support multiline secrets (use Vault instead)"
+        }
         $input = "protocol=https`nhost=secret-ops.local`npath=$GcmKey`nusername=secret-ops`npassword=$plain`n`n"
         $input | git @GcmGitArgs credential approve
         Assert-NativeSuccess 'git credential approve'

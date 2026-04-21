@@ -70,9 +70,19 @@ _probe_keyring() {
 }
 
 _detect_backend() {
-  if [ -n "${VAULT_ADDR:-}" ] && command -v vault &>/dev/null && vault token lookup &>/dev/null 2>&1 && _probe_vault; then
-    echo "vault"
-  elif [ "$(uname -s)" = "Darwin" ] && command -v security &>/dev/null; then
+  local vault_configured=false
+  if [ -n "${VAULT_ADDR:-}" ] && command -v vault &>/dev/null && vault token lookup &>/dev/null 2>&1; then
+    vault_configured=true
+    if _probe_vault; then
+      echo "vault"
+      return 0
+    fi
+    # Vault is configured but unusable — fail closed, don't silently downgrade
+    echo "ERROR: Vault is configured (VAULT_ADDR set, token valid) but probe to secret/secret-ops/ failed." >&2
+    echo "Fix Vault permissions, or delete $BACKEND_FILE and unset VAULT_ADDR to use a local backend." >&2
+    return 1
+  fi
+  if [ "$(uname -s)" = "Darwin" ] && command -v security &>/dev/null; then
     echo "keychain"
   elif [ "$(uname -s)" = "Linux" ] && command -v keyctl &>/dev/null && _probe_keyring; then
     echo "keyring"
@@ -145,6 +155,12 @@ _store_keyring() {
 _store_gcm() {
   local key="$1" store_rc=0
   read -rsp "Enter secret for $key: " val; echo
+  # GCM uses line-based git credential protocol — reject multiline secrets
+  if printf '%s' "$val" | grep -q $'\n'; then
+    echo "ERROR: GCM backend does not support multiline secrets (use Vault or Keychain instead)" >&2
+    val=""
+    return 1
+  fi
   printf 'protocol=https\nhost=secret-ops.local\npath=%s\nusername=secret-ops\npassword=%s\n\n' "$key" "$val" \
     | git -c credential.helper=manager -c credential.useHttpPath=true credential approve || store_rc=$?
   val=""

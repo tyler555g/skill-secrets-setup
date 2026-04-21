@@ -48,6 +48,8 @@ Secure secret operations with an inject model. The agent orchestrates; trusted s
 | Git Credential Manager | `git credential-manager` | Any | `git credential-manager --version` |
 
 **Auto-detect priority:** Vault → Keychain → keyctl → GCM. First success pins the backend.
+**Fail-closed:** If Vault is configured (VAULT_ADDR set, token valid) but unusable, detection fails rather than silently downgrading to a local backend.
+**GCM limitation:** Does not support multiline secrets (PEM keys, JSON creds). Use Vault or Keychain for those.
 
 ## Protocol
 
