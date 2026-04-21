@@ -64,7 +64,14 @@ function Get-Backend {
         # Detect: Vault → GCM (use $LASTEXITCODE for native commands)
         if ($env:VAULT_ADDR -and (Get-Command vault -ErrorAction SilentlyContinue)) {
             vault token lookup 2>$null | Out-Null
-            if ($LASTEXITCODE -eq 0) { 'vault' | Out-File $BackendFile -NoNewline -Encoding utf8; return 'vault' }
+            if ($LASTEXITCODE -eq 0) {
+                # Probe: verify we can write+delete in our namespace
+                vault kv put 'secret/secret-ops/_probe' value=probe_test 2>$null | Out-Null
+                if ($LASTEXITCODE -eq 0) {
+                    vault kv delete 'secret/secret-ops/_probe' 2>$null | Out-Null
+                    'vault' | Out-File $BackendFile -NoNewline -Encoding utf8; return 'vault'
+                }
+            }
         }
         if (Get-Command git -ErrorAction SilentlyContinue) {
             git credential-manager --version 2>$null | Out-Null
