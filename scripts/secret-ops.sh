@@ -147,7 +147,26 @@ _ensure_backend() {
 # ── Backend operations ───────────────────────────────────────────────────────
 
 # -- Store (secrets via stdin, never argv) --
-_store_keychain()  { security add-generic-password -a "secret-ops" -s "${SERVICE_PREFIX}$1" -U -w; }
+_store_keychain() {
+  local key="$1"
+  local svc="${SERVICE_PREFIX}${key}"
+  if [ "$(uname -s)" = "Darwin" ] && command -v osascript >/dev/null 2>&1; then
+    # macOS — GUI dialog; osascript passes value directly to security -w so
+    # it never flows through the agent's shell or pseudo-TTY.
+    osascript \
+      -e "set _p to text returned of (display dialog \"Enter secret for ${key}:\" default answer \"\" with hidden answer buttons {\"Cancel\",\"OK\"} default button \"OK\")" \
+      -e "do shell script \"security add-generic-password -a secret-ops -s '${svc}' -U -w \" & quoted form of _p" \
+      2>&1 || return 1
+  elif [ -t 0 ]; then
+    # Non-macOS with real TTY — read interactively then pass as -w arg
+    IFS= read -rsp "Enter secret for ${key}: " _sec_val; echo >&2
+    security add-generic-password -a "secret-ops" -s "$svc" -U -w "$_sec_val"
+    _sec_val=""
+  else
+    echo "ERROR: No TTY and no GUI available — cannot prompt for secret" >&2
+    return 1
+  fi
+}
 _store_keyring() {
   local key="$1" store_rc=0
   IFS= read -rsp "Enter secret for $key: " val; echo
