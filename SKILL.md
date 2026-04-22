@@ -1,15 +1,15 @@
 ---
 name: secret-management
-description: "Secure secret operations — store, inject, list, delete, exists. Agent never sees values; trusted scripts handle credential backends (macOS Keychain, Linux keyring, GCM, Vault) with JIT injection into subprocess scope."
+description: "Secure secret operations — store, inject, list, delete, exists. Agent never sees values; trusted scripts handle credential backends (macOS Keychain, Linux keyring, PowerShell SecretStore, GCM, Vault) with JIT injection into subprocess scope."
 allowed-tools: read_file file_search grep_search apply_patch create_file list_dir run_in_terminal
 metadata:
-  version: "0.2.0"
+  version: "0.2.1"
   source: "@tyler.given/skill-secrets-setup"
   supported_languages: "bash, zsh, powershell"
   supported_frameworks: "github-copilot-skills"
   supported_operating_systems: "macos, linux, windows"
   categories: "security, tooling, onboarding"
-  tags: "secrets, credentials, keychain, keyring, vault, gcm, git-credential-manager, security, inject-model"
+  tags: "secrets, credentials, keychain, keyring, secret-store, vault, gcm, git-credential-manager, security, inject-model"
 user-invocable: true
 ---
 
@@ -45,9 +45,10 @@ Secure secret operations with an inject model. The agent orchestrates; trusted s
 | HashiCorp Vault | `vault` | Any | `command -v vault` + `VAULT_ADDR` set |
 | macOS Keychain | `security` | macOS | `command -v security` on Darwin |
 | Linux keyring | `keyctl` | Linux | `command -v keyctl` on Linux |
+| PowerShell SecretStore | `Microsoft.PowerShell.SecretStore` | Windows | Module installed |
 | Git Credential Manager | `git credential-manager` | Any | `git credential-manager --version` |
 
-**Auto-detect priority:** Vault → Keychain → keyctl → GCM. First success pins the backend.
+**Auto-detect priority:** Vault → Keychain → keyctl → SecretStore → GCM. First success pins the backend.
 **Fail-closed:** If Vault is configured (VAULT_ADDR set, token valid) but unusable, detection fails rather than silently downgrading to a local backend.
 **Store limitation:** All interactive stores are single-line only (`read -rsp` / `Read-Host`). For multiline secrets (PEM, JSON), store via the backend's native tool and use secret-ops for inject/exists/delete.
 **Windows inject:** Works with native executables (.exe). For batch shims (.cmd/.bat), use: `inject KEY --confirm -- cmd.exe /c script.cmd args`

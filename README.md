@@ -40,7 +40,8 @@ git clone https://github.com/tyler555g/skill-secret-management.git ~/.copilot/sk
 | HashiCorp Vault | `vault` | Any | 1st (if `VAULT_ADDR` set + authenticated) |
 | macOS Keychain | `security` | macOS | 2nd |
 | Linux keyring | `keyctl` | Linux | 3rd |
-| Git Credential Manager | `git credential-manager` | Any | 4th (cross-platform fallback) |
+| PowerShell SecretStore | `Microsoft.PowerShell.SecretStore` | Windows | 4th |
+| Git Credential Manager | `git credential-manager` | Any | 5th (cross-platform fallback) |
 
 Backend is **pinned on first use** to `~/.config/secret-ops/backend`. No silent downgrade.
 
@@ -68,6 +69,7 @@ SKILL.md is protocol-only (~625 tokens). All logic lives in scripts that are exe
 - [Linux keyctl man page](https://man7.org/linux/man-pages/man1/keyctl.1.html)
 - [Linux kernel key management](https://www.kernel.org/doc/html/latest/security/keys/core.html)
 - [Git Credential Manager](https://github.com/git-ecosystem/git-credential-manager)
+- [Microsoft PowerShell SecretStore](https://github.com/PowerShell/SecretStore)
 - [HashiCorp Vault](https://developer.hashicorp.com/vault/docs)
 - [AI-Human Interaction Defaults](https://github.com/tyler555g/best-practices/blob/main/packages/content/technology_and_information/data_science_and_ai/ai-human-interaction-defaults.md)
 - [12-Factor Agents](https://github.com/humanlayer/12-factor-agents)

@@ -4,24 +4,36 @@
   secret-ops.ps1 — secure secret operations (inject model)
   Values never printed to stdout. Agent calls this; never reads source.
 #>
-# No [CmdletBinding()]/param() — parse $args manually to preserve '--' token
-# (PowerShell's parameter binder consumes '--' as end-of-parameters)
+[CmdletBinding(DefaultParameterSetName='NoKeyOp')]
+param(
+    [Parameter(ParameterSetName='KeyOp', Position=0, Mandatory)]
+    [Parameter(ParameterSetName='NoKeyOp', Position=0)]
+    [ValidateSet('store', 'inject', 'list', 'delete', 'exists', 'help')]
+    [string]$Operation = 'help',
+
+    [Parameter(ParameterSetName='KeyOp', Position=1, Mandatory)]
+    [string]$Key,
+
+    [Alias('b')]
+    [string]$Backend,
+
+    [Parameter(ParameterSetName='KeyOp')]
+    [switch]$Confirm,
+
+    [Parameter(ParameterSetName='KeyOp', ValueFromRemainingArguments)]
+    [string[]]$RemainingArgs
+)
+
+Set-Variable -Name SECRET_STORE -Value 'secret-store' -Option Constant
+Set-Variable -Name SECRET_STORE_VAULT -Value 'secret-ops' -Option Constant
 
 $ErrorActionPreference = 'Stop'
 
-$Operation = if ($args.Length -ge 1) { $args[0] } else { 'help' }
-$Key = if ($args.Length -ge 2) { $args[1] } else { '' }
-$CommandArgs = if ($args.Length -ge 3) { [string[]]$args[2..($args.Length-1)] } else { @() }
-
-$ValidOps = @('store','inject','list','delete','exists','help')
-if ($Operation -notin $ValidOps) {
-    throw "Invalid operation '$Operation'. Valid: $($ValidOps -join ', ')"
-}
 $ConfigDir = Join-Path $env:USERPROFILE '.config\secret-ops'
 $BackendFile = Join-Path $ConfigDir 'backend'
 $AuditLog = Join-Path $ConfigDir 'audit.log'
 $LockFile = Join-Path $ConfigDir '.backend.lock'
-$ValidBackends = @('vault', 'gcm')
+$ValidBackends = @('vault', $SECRET_STORE, 'gcm')
 
 if (-not (Test-Path $ConfigDir)) { New-Item -ItemType Directory -Path $ConfigDir -Force | Out-Null }
 
@@ -35,17 +47,22 @@ function Assert-ValidKey {
 # ── Audit ────────────────────────────────────────────────────────────────────
 function Write-Audit {
     param([string]$Op, [string]$AuditKey = '', [int]$Rc = 0)
-    $backend = if (Test-Path $BackendFile) { Get-Content $BackendFile } else { 'none' }
+    $backendUsed = if (Test-Path $BackendFile) { Get-Content $BackendFile } else { 'none' }
     $safeKey = $AuditKey -replace '[\r\n\t]', ''
     $ts = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-    "$ts op=$Op key=$safeKey backend=$backend rc=$Rc" | Out-File -Append -FilePath $AuditLog -Encoding utf8
+    "$ts op=$Op key=$safeKey backend=$backendUsed rc=$Rc" | Out-File -Append -FilePath $AuditLog -Encoding utf8
 }
 
 # ── Backend detection & pinning ──────────────────────────────────────────────
 function Get-Backend {
+    if ($Backend) {
+        if ($Backend -notin $ValidBackends) { throw "Invalid backend '$Backend' specified" }
+        return $Backend
+    }
+
     if (Test-Path $BackendFile) {
         $b = (Get-Content $BackendFile).Trim()
-        if ($b -notin $ValidBackends) { throw "Invalid pinned backend '$b' — delete $BackendFile to re-detect" }
+        if ($b -notin $ValidBackends) { throw "Invalid pinned backend '$b' - delete $BackendFile to re-detect" }
         return $b
     }
 
@@ -60,7 +77,7 @@ function Get-Backend {
         # Re-check after lock
         if (Test-Path $BackendFile) { return (Get-Content $BackendFile).Trim() }
 
-        # Detect: Vault → GCM (use $LASTEXITCODE for native commands)
+        # Detect: Vault → GCM → SecretStore  (use $LASTEXITCODE for native commands)
         if ($env:VAULT_ADDR -and (Get-Command vault -ErrorAction SilentlyContinue)) {
             # VAULT_ADDR set + vault exists = user intends Vault — fail closed on any issue
             vault token lookup 2>$null | Out-Null
@@ -80,6 +97,11 @@ function Get-Backend {
         if (Get-Command git -ErrorAction SilentlyContinue) {
             git credential-manager --version 2>$null | Out-Null
             if ($LASTEXITCODE -eq 0) { 'gcm' | Out-File $BackendFile -NoNewline -Encoding utf8; return 'gcm' }
+        }
+        if (Get-Module Microsoft.PowerShell.SecretManagement -ListAvailable -ErrorAction SilentlyContinue) {
+            if (Get-Module Microsoft.PowerShell.SecretStore -ListAvailable -ErrorAction SilentlyContinue) {
+                $SECRET_STORE | Out-File $BackendFile -NoNewline -Encoding utf8; return $SECRET_STORE
+            }
         }
         throw 'No supported secret backend found'
     } finally {
@@ -106,6 +128,49 @@ function Assert-NativeSuccess {
     param([string]$Context = 'Native command')
     if ($LASTEXITCODE -ne 0) { throw "$Context failed (exit code $LASTEXITCODE)" }
 }
+
+# ── SecretStore helpers ──────────────────────────────────────────────────────
+function Get-SecretOpsVault {
+    $v = Get-SecretVault -Name $SECRET_STORE_VAULT -ErrorAction SilentlyContinue
+    if (-not $v) {
+        Register-SecretVault -Name $SECRET_STORE_VAULT -ModuleName Microsoft.PowerShell.SecretStore -DefaultVault:$false -ErrorAction Stop
+        $v = Get-SecretVault -Name $SECRET_STORE_VAULT
+    }
+    return $v
+}
+
+function Invoke-SecretStoreStore {
+    param([string]$SecretStoreKey)
+    $null = Get-SecretOpsVault
+    $secret = Read-Host "Enter secret for $SecretStoreKey" -AsSecureString
+    try {
+        Set-Secret -Name $SecretStoreKey -SecureStringSecret $secret -Vault $SECRET_STORE_VAULT -ErrorAction Stop
+    } finally {
+        $secret = $null
+    }
+}
+
+function Invoke-SecretStoreGet {
+    param([string]$SecretStoreKey)
+    $null = Get-SecretOpsVault
+    $val = Get-Secret -Name $SecretStoreKey -Vault $SECRET_STORE_VAULT -AsPlainText -ErrorAction SilentlyContinue
+    if ($null -eq $val) { throw "Secret '$SecretStoreKey' not found" }
+    return $val
+}
+
+function Test-SecretStoreExists {
+    param([string]$SecretStoreKey)
+    $null = Get-SecretOpsVault
+    return [bool](Get-SecretInfo -Name $SecretStoreKey -Vault $SECRET_STORE_VAULT -ErrorAction SilentlyContinue)
+}
+
+function Remove-SecretStoreSecret {
+    param([string]$SecretStoreKey)
+    $null = Get-SecretOpsVault
+    Remove-Secret -Name $SecretStoreKey -Vault $SECRET_STORE_VAULT -ErrorAction Stop
+}
+
+# ── GCM helpers ──────────────────────────────────────────────────────────────
 $GcmGitArgs = @('-c', 'credential.helper=manager', '-c', 'credential.useHttpPath=true')
 
 function Invoke-GcmStore {
@@ -203,154 +268,173 @@ function Test-VaultExists {
     try { Invoke-VaultGet $VaultKey | Out-Null; return $true } catch { return $false }
 }
 
-# ── Main ─────────────────────────────────────────────────────────────────────
-try {
-    switch ($Operation) {
-        'store' {
-            if (-not $Key) { throw 'Usage: secret-ops.ps1 store KEY' }
-            Assert-ValidKey $Key
-            $backend = Get-Backend
-            switch ($backend) {
-                'gcm'   { Invoke-GcmStore $Key }
-                'vault' { Invoke-VaultStore $Key }
-                default { throw "Unsupported backend '$backend'" }
-            }
-            Write-Audit -Op store -AuditKey $Key -Rc 0
-        }
-
-        'inject' {
-            if (-not $Key) { throw 'Usage: secret-ops.ps1 inject KEY --confirm -- cmd args…' }
-            Assert-ValidKey $Key
-
-            # Inject requires env-var-safe key name (no dots or hyphens)
-            if ($Key -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') {
-                throw "Key '$Key' is not a valid environment variable name (use [A-Za-z_][A-Za-z0-9_]*)"
+function Main {
+    $script:LastExitCode = 0
+    try {
+        switch ($Operation) {
+            'store' {
+                Assert-ValidKey $Key
+                $backend = Get-Backend
+                switch ($backend) {
+                    'gcm'         { Invoke-GcmStore $Key }
+                    'vault'       { Invoke-VaultStore $Key }
+                    $SECRET_STORE { Invoke-SecretStoreStore $Key }
+                    default { throw "Unsupported backend '$backend'" }
+                }
+                Write-Audit -Op store -AuditKey $Key -Rc 0
             }
 
-            # Parse --confirm and -- separator
-            $confirmed = $false
-            $sepIdx = -1
-            for ($i = 0; $i -lt $CommandArgs.Length; $i++) {
-                if ($CommandArgs[$i] -eq '--confirm') { $confirmed = $true }
-                if ($CommandArgs[$i] -eq '--') { $sepIdx = $i; break }
-            }
-            if (-not $confirmed) { throw "inject requires --confirm flag (approval gate)" }
-            if ($sepIdx -lt 0) { throw "Missing '--' separator" }
-            if ($sepIdx -ge $CommandArgs.Length - 1) { throw "No command specified after '--'" }
-            $cmd = $CommandArgs[($sepIdx+1)..($CommandArgs.Length-1)]
+            'inject' {
+                Assert-ValidKey $Key
 
-            $backend = Get-Backend
-            $val = switch ($backend) {
-                'gcm'   { Invoke-GcmGet $Key }
-                'vault' { Invoke-VaultGet $Key }
-                default { throw "Unsupported backend '$backend'" }
-            }
-            # Launch as real child process with scoped env (ProcessStartInfo)
-            $procRc = 1
-            try {
-                $psi = New-Object System.Diagnostics.ProcessStartInfo
-                $psi.FileName = $cmd[0]
-                if ($cmd.Length -gt 1) {
-                    # Proper Windows command-line argument quoting (handles backslash+quote)
-                    $quotedArgs = $cmd[1..($cmd.Length-1)] | ForEach-Object {
-                        if ($_ -eq '') {
-                            '""'
-                        } elseif ($_ -match '[\s"]') {
-                            # Escape backslash runs preceding quotes or end-of-string, then wrap
-                            $escaped = [regex]::Replace($_, '(\\*)"', '$1$1\"')
-                            $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
-                            "`"$escaped`""
-                        } else {
-                            $_
+                # Inject requires env-var-safe key name (no dots or hyphens)
+                if ($Key -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') {
+                    throw "Key '$Key' is not a valid environment variable name (use [A-Za-z_][A-Za-z0-9_]*)"
+                }
+
+                if (-not $Confirm) { throw "inject requires -Confirm flag (approval gate)" }
+
+                # NEW LOGIC: Look for '--', but if it's missing, take everything
+                if ($null -eq $RemainingArgs -or $RemainingArgs.Length -eq 0) {
+                    throw "No command specified"
+                }
+
+                $sepIdx = [Array]::IndexOf($RemainingArgs, '--')
+
+                if ($sepIdx -ge 0) {
+                    # If '--' exists, the command starts after it
+                    $cmd = $RemainingArgs[($sepIdx+1)..($RemainingArgs.Length-1)]
+                } else {
+                    # If '--' is missing (consumed by PS), the whole array is the command
+                    $cmd = $RemainingArgs
+                }
+
+                if ($cmd.Length -eq 0) { throw "No command specified after '--'" }
+
+                $backend = Get-Backend
+                $val = switch ($backend) {
+                    'gcm'         { Invoke-GcmGet $Key }
+                    'vault'       { Invoke-VaultGet $Key }
+                    $SECRET_STORE { Invoke-SecretStoreGet $Key }
+                    default { throw "Unsupported backend '$backend'" }
+                }
+                # Launch as real child process with scoped env (ProcessStartInfo)
+                $procRc = 1
+                try {
+                    $psi = New-Object System.Diagnostics.ProcessStartInfo
+                    $psi.FileName = $cmd[0]
+                    if ($cmd.Length -gt 1) {
+                        # Proper Windows command-line argument quoting (handles backslash+quote)
+                        $quotedArgs = $cmd[1..($cmd.Length-1)] | ForEach-Object {
+                            if ($_ -eq '') {
+                                '""'
+                            } elseif ($_ -match '[\s"]') {
+                                # Escape backslash runs preceding quotes or end-of-string, then wrap
+                                $escaped = [regex]::Replace($_, '(\\*)"', '$1$1\"')
+                                $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
+                                "`"$escaped`""
+                            } else {
+                                $_
+                            }
                         }
+                        $psi.Arguments = $quotedArgs -join ' '
                     }
-                    $psi.Arguments = $quotedArgs -join ' '
+                    $psi.UseShellExecute = $false
+                    $psi.RedirectStandardOutput = $false
+                    $psi.RedirectStandardError = $false
+                    # Copy current env + inject secret
+                    foreach ($e in [System.Environment]::GetEnvironmentVariables().GetEnumerator()) {
+                        $psi.EnvironmentVariables[$e.Key] = $e.Value
+                    }
+                    $psi.EnvironmentVariables[$Key] = $val
+                    $proc = [System.Diagnostics.Process]::Start($psi)
+                    $proc.WaitForExit()
+                    $procRc = $proc.ExitCode
+                } finally {
+                    $val = $null
                 }
-                $psi.UseShellExecute = $false
-                $psi.RedirectStandardOutput = $false
-                $psi.RedirectStandardError = $false
-                # Copy current env + inject secret
-                foreach ($e in [System.Environment]::GetEnvironmentVariables()) {
-                    $psi.EnvironmentVariables[$e.Key] = $e.Value
+                Write-Audit -Op inject -AuditKey $Key -Rc $procRc
+                $script:LastExitCode = $procRc
+                if ($procRc -ne 0 -and $MyInvocation.InvocationName -eq '.') { throw "ExitCalledWith_$procRc" }
+                return
+            }
+
+            'list' {
+                $backend = Get-Backend
+                switch ($backend) {
+                    'gcm'   { Write-Host '(GCM does not support list — use OS credential manager UI)' }
+                    'vault' {
+                        vault kv list secret/secret-ops/ 2>$null
+                        Assert-NativeSuccess 'vault kv list'
+                    }
+                    $SECRET_STORE {
+                        Get-SecretInfo -Vault 'secret-ops' | Select-Object -ExpandProperty Name
+                    }
+                    default { throw "Unsupported backend '$backend'" }
                 }
-                $psi.EnvironmentVariables[$Key] = $val
-                $proc = [System.Diagnostics.Process]::Start($psi)
-                $proc.WaitForExit()
-                $procRc = $proc.ExitCode
-            } finally {
-                $val = $null
+                Write-Audit -Op list -Rc 0
             }
-            Write-Audit -Op inject -AuditKey $Key -Rc $procRc
-            exit $procRc
-        }
 
-        'list' {
-            $backend = Get-Backend
-            switch ($backend) {
-                'gcm'   { Write-Host '(GCM does not support list — use OS credential manager UI)' }
-                'vault' {
-                    vault kv list secret/secret-ops/ 2>$null
-                    Assert-NativeSuccess 'vault kv list'
+            'delete' {
+                Assert-ValidKey $Key
+                if (-not $Confirm) { throw "delete requires -Confirm flag (approval gate)" }
+
+                $backend = Get-Backend
+                switch ($backend) {
+                    'gcm'         { Remove-GcmSecret $Key }
+                    'vault'       {
+                        vault kv delete "secret/secret-ops/$Key" 2>$null | Out-Null
+                        Assert-NativeSuccess 'vault kv delete'
+                    }
+                    $SECRET_STORE { Remove-SecretStoreSecret $Key }
+                    default { throw "Unsupported backend '$backend'" }
                 }
-                default { throw "Unsupported backend '$backend'" }
+                Write-Audit -Op delete -AuditKey $Key -Rc 0
             }
-            Write-Audit -Op list -Rc 0
-        }
 
-        'delete' {
-            if (-not $Key) { throw 'Usage: secret-ops.ps1 delete KEY --confirm' }
-            Assert-ValidKey $Key
-
-            # Require --confirm flag
-            $confirmed = $false
-            foreach ($arg in $CommandArgs) {
-                if ($arg -eq '--confirm') { $confirmed = $true }
-            }
-            if (-not $confirmed) { throw "delete requires --confirm flag (approval gate)" }
-
-            $backend = Get-Backend
-            switch ($backend) {
-                'gcm'   { Remove-GcmSecret $Key }
-                'vault' {
-                    vault kv delete "secret/secret-ops/$Key" 2>$null | Out-Null
-                    Assert-NativeSuccess 'vault kv delete'
+            'exists' {
+                Assert-ValidKey $Key
+                $backend = Get-Backend
+                $found = switch ($backend) {
+                    'gcm'         { Test-GcmExists $Key }
+                    'vault'       { Test-VaultExists $Key }
+                    $SECRET_STORE { Test-SecretStoreExists $Key }
+                    default { throw "Unsupported backend '$backend'" }
                 }
-                default { throw "Unsupported backend '$backend'" }
+                $rc = [int](-not $found)
+                Write-Audit -Op exists -AuditKey $Key -Rc $rc
+                if (-not $found) { $script:LastExitCode = 1; return }
             }
-            Write-Audit -Op delete -AuditKey $Key -Rc 0
-        }
 
-        'exists' {
-            if (-not $Key) { throw 'Usage: secret-ops.ps1 exists KEY' }
-            Assert-ValidKey $Key
-            $backend = Get-Backend
-            $found = switch ($backend) {
-                'gcm'   { Test-GcmExists $Key }
-                'vault' { Test-VaultExists $Key }
-                default { throw "Unsupported backend '$backend'" }
-            }
-            Write-Audit -Op exists -AuditKey $Key -Rc ([int](-not $found))
-            if (-not $found) { exit 1 }
-        }
+            'help' {
+                @'
+secret-ops.ps1 - secure secret operations (inject model)
 
-        'help' {
-            @'
-secret-ops.ps1 — secure secret operations (inject model)
+Usage:
+  .\secret-ops.ps1 store KEY [-Backend NAME]
+  .\secret-ops.ps1 inject KEY -Confirm [-Backend NAME] -- cmd args...
+  .\secret-ops.ps1 list [-Backend NAME]
+  .\secret-ops.ps1 delete KEY -Confirm [-Backend NAME]
+  .\secret-ops.ps1 exists KEY [-Backend NAME]
 
-Operations:
-  store  KEY                        Store a secret (interactive prompt)
-  inject KEY --confirm -- cmd …     Inject secret into subprocess env
-  list                              List stored key names
-  delete KEY --confirm              Remove a secret
-  exists KEY                        Check if a secret exists (exit 0/1)
-
-Backends: vault, gcm
+Backends: vault, secret-store, gcm
 Config:   %USERPROFILE%\.config\secret-ops\
-'@ | Write-Host
+'@ | Write-Output
+            }
         }
+    } catch {
+        Write-Audit -Op $Operation -AuditKey $Key -Rc 1
+        Write-Error $_.Exception.Message
+        $script:LastExitCode = 1
+        return
     }
-} catch {
-    Write-Audit -Op $Operation -AuditKey $Key -Rc 1
-    Write-Error $_.Exception.Message
-    exit 1
+}
+
+# Only execute Main if script is NOT being dot-sourced
+if ($MyInvocation.InvocationName -ne '.') {
+    $script:LastExitCode = 0
+    Main
+    if ($null -ne $script:LastExitCode -and $script:LastExitCode -ne 0) {
+        exit $script:LastExitCode
+    }
 }
